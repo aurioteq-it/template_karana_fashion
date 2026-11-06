@@ -1,0 +1,4 @@
+project_id = "template_karana_fashion"
+
+[auth]
+enable_signup = false
