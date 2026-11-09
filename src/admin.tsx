@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { ArrowLeft, BarChart3, Box, Check, ChevronRight, ClipboardList, LayoutDashboard, LogOut, Menu, Package, Plus, Search, Settings, Shield, ShoppingBag, Users, X } from 'lucide-react'
 import { Link, NavLink, Navigate, Route, Routes, useNavigate } from 'react-router-dom'
 import type { Session } from '@supabase/supabase-js'
@@ -8,7 +8,7 @@ import { SalesReports } from './sales-reports'
 import { DataCleanup } from './data-cleanup'
 
 type Role = 'admin' | 'staff'
-type Profile = { id: string; email: string; role: Role; active: boolean }
+type Profile = { id: string; email: string; role: Role; active: boolean; invitation_accepted_at: string | null }
 type Order = {
   id: string; reference: string; status: string; name: string; phone: string; district: string; area: string; address: string
   quantity: number; product_name: string; product_image_url?: string; variant_label: string; unit_price: number; delivery_fee: number; total: number
@@ -38,7 +38,7 @@ export function AdminApp() {
       if (!alive) return
       setSession(current)
       if (current) {
-        const { data } = await supabase!.from('profiles').select('id,email,role,active').eq('id', current.user.id).maybeSingle()
+        const { data } = await supabase!.from('profiles').select('id,email,role,active,invitation_accepted_at').eq('id', current.user.id).maybeSingle()
         if (alive) setProfile(data as Profile | null)
       } else setProfile(null)
       if (alive) setLoading(false)
@@ -51,7 +51,8 @@ export function AdminApp() {
   if (loading) return <div className="state-page">ড্যাশবোর্ড লোড হচ্ছে…</div>
   if (!session) return <Navigate to="/team/access" replace />
   if (!profile || !['admin', 'staff'].includes(profile.role)) return <div className="state-page"><h2>প্রবেশাধিকার নেই</h2><p>এই অ্যাকাউন্টের ড্যাশবোর্ড অনুমতি নেই।</p><button className="btn btn-dark" onClick={() => supabase!.auth.signOut()}>সাইন আউট</button></div>
-  if (!profile?.active) return <div className="state-page"><h2>প্রবেশাধিকার নেই</h2><p>আপনার অ্যাকাউন্ট সক্রিয় নয়। প্রশাসকের সঙ্গে যোগাযোগ করুন।</p><button className="btn btn-dark" onClick={() => supabase!.auth.signOut()}>সাইন আউট</button></div>
+  if (profile.role === 'staff' && !profile.invitation_accepted_at) return <div className="state-page"><h2>আমন্ত্রণ অপেক্ষমাণ</h2><p>ইমেইলের আমন্ত্রণ লিংক খুলে অ্যাকাউন্ট সেটআপ শেষ করুন।</p><button className="btn btn-dark" onClick={() => supabase!.auth.signOut()}>সাইন আউট</button></div>
+  if (!profile.active) return <div className="state-page"><h2>প্রবেশাধিকার নেই</h2><p>আপনার অ্যাকাউন্ট সক্রিয় নয়। প্রশাসকের সঙ্গে যোগাযোগ করুন।</p><button className="btn btn-dark" onClick={() => supabase!.auth.signOut()}>সাইন আউট</button></div>
   const admin = profile.role === 'admin'
   const nav = [
     { path: '/admin', label: 'ওভারভিউ', icon: LayoutDashboard, end: true },
@@ -210,17 +211,35 @@ function StaffManager() {
   const [email, setEmail] = useState('')
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
-  async function refresh() { const result = await supabase!.from('profiles').select('id,email,role,active').order('email'); if (result.data) setProfiles(result.data as Profile[]) }
-  useEffect(() => { void refresh() }, [])
-  async function invite(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault(); setBusy(true); setMessage('')
-    const result = await supabase!.functions.invoke('invite-staff', { body: { email: email.trim() } })
+  async function refresh() { const result = await supabase!.from('profiles').select('id,email,role,active,invitation_accepted_at').order('email'); if (result.data) setProfiles(result.data as Profile[]) }
+  useEffect(() => {
+    void refresh()
+    const timer = window.setInterval(() => { if (document.visibilityState === 'visible') void refresh() }, 15000)
+    return () => window.clearInterval(timer)
+  }, [])
+  async function sendInvite(address: string) {
+    if (busy) return
+    setBusy(true); setMessage('')
+    const result = await supabase!.functions.invoke('invite-staff', { body: { email: address } })
     setBusy(false)
-    if (result.error) setMessage(result.data?.error || result.error.message)
-    else { setMessage('আমন্ত্রণ পাঠানো হয়েছে।'); setEmail(''); await refresh() }
+    if (result.error) {
+      let message = result.error.message
+      if (result.error.context instanceof Response) {
+        try {
+          const body: unknown = await result.error.context.json()
+          if (body && typeof body === 'object' && 'error' in body && typeof body.error === 'string') message = body.error
+        } catch { /* Keep the transport error if the response is not JSON. */ }
+      }
+      if (/email rate limit exceeded|email sending limit reached/i.test(message)) {
+        message = 'ইমেইল পাঠানোর সীমা পূর্ণ হয়েছে। সীমা রিসেট হলে আবার চেষ্টা করুন, অথবা Supabase Auth-এর SMTP Settings-এ নিজস্ব ইমেইল সার্ভার সেট করুন।'
+      }
+      setMessage(message)
+    }
+    else { setMessage(result.data?.resent ? 'আমন্ত্রণ আবার পাঠানো হয়েছে।' : 'আমন্ত্রণ পাঠানো হয়েছে।'); setEmail(''); await refresh() }
   }
-  async function toggle(profile: Profile) { const result = await supabase!.from('profiles').update({ active: !profile.active }).eq('id', profile.id); setMessage(result.error?.message || 'স্টাফ আপডেট হয়েছে।'); await refresh() }
-  return <><PageHead eyebrow="TEAM ACCESS" title="স্টাফ" description="অনুমোদিত স্টাফকে আমন্ত্রণ জানান ও অ্যাক্সেস নিয়ন্ত্রণ করুন।" /><Notice message={message} error={!['আমন্ত্রণ পাঠানো হয়েছে।', 'স্টাফ আপডেট হয়েছে।'].includes(message)} /><div className="admin-panel editor-panel"><h2>স্টাফ আমন্ত্রণ</h2><form onSubmit={invite} className="invite-form"><label>ইমেইল<input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="staff@example.com" /></label><button className="btn btn-dark" disabled={busy}><Plus size={18} /> {busy ? 'পাঠানো হচ্ছে…' : 'আমন্ত্রণ পাঠান'}</button></form></div><div className="admin-panel"><div className="panel-header"><h2>টিম সদস্য</h2></div><div className="table-scroll"><table className="admin-table"><thead><tr><th>ইমেইল</th><th>রোল</th><th>অবস্থা</th><th>অ্যাকশন</th></tr></thead><tbody>{profiles.map(profile => <tr key={profile.id}><td>{profile.email}</td><td>{profile.role}</td><td>{profile.active ? 'সক্রিয়' : 'বন্ধ'}</td><td>{profile.role === 'staff' && <button className="table-action" onClick={() => toggle(profile)}>{profile.active ? 'বন্ধ করুন' : 'সক্রিয় করুন'}</button>}</td></tr>)}</tbody></table></div></div></>
+  async function invite(event: FormEvent<HTMLFormElement>) { event.preventDefault(); await sendInvite(email.trim()) }
+  async function toggle(profile: Profile) { if (!profile.invitation_accepted_at) return; const result = await supabase!.from('profiles').update({ active: !profile.active }).eq('id', profile.id); setMessage(result.error?.message || 'স্টাফ আপডেট হয়েছে।'); await refresh() }
+  return <><PageHead eyebrow="TEAM ACCESS" title="স্টাফ" description="অনুমোদিত স্টাফকে আমন্ত্রণ জানান ও অ্যাক্সেস নিয়ন্ত্রণ করুন।" /><Notice message={message} error={!['আমন্ত্রণ পাঠানো হয়েছে।', 'আমন্ত্রণ আবার পাঠানো হয়েছে।', 'স্টাফ আপডেট হয়েছে।'].includes(message)} /><div className="admin-panel editor-panel"><h2>স্টাফ আমন্ত্রণ</h2><form onSubmit={invite} className="invite-form"><label>ইমেইল<input type="email" required value={email} onChange={e => setEmail(e.target.value)} placeholder="staff@example.com" /></label><button className="btn btn-dark" disabled={busy}><Plus size={18} /> {busy ? 'পাঠানো হচ্ছে…' : 'আমন্ত্রণ পাঠান'}</button></form></div><div className="admin-panel"><div className="panel-header"><h2>টিম সদস্য</h2></div><div className="table-scroll"><table className="admin-table"><thead><tr><th>ইমেইল</th><th>রোল</th><th>অবস্থা</th><th>অ্যাকশন</th></tr></thead><tbody>{profiles.map(profile => <tr key={profile.id}><td>{profile.email}</td><td>{profile.role}</td><td>{profile.role === 'staff' && !profile.invitation_accepted_at ? 'অপেক্ষমাণ' : profile.active ? 'সক্রিয়' : 'বন্ধ'}</td><td>{profile.role === 'staff' && (profile.invitation_accepted_at ? <button type="button" className="table-action" onClick={() => toggle(profile)}>{profile.active ? 'বন্ধ করুন' : 'সক্রিয় করুন'}</button> : <button type="button" className="table-action" disabled={busy} onClick={() => { void sendInvite(profile.email) }}>আবার পাঠান</button>)}</td></tr>)}</tbody></table></div></div></>
 }
 
 export function AdminAcceptInvite() {
@@ -229,19 +248,26 @@ export function AdminAcceptInvite() {
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [busy, setBusy] = useState(false)
+  const verification = useRef<Promise<boolean> | null>(null)
   const navigate = useNavigate()
   useEffect(() => {
     if (!supabase) { setError('Supabase সেটআপ প্রয়োজন।'); return }
     const params = new URLSearchParams(window.location.search)
     const tokenHash = params.get('token_hash')
+    const tokenType = params.get('type') === 'recovery' ? 'recovery' : 'invite'
     async function check() {
       if (tokenHash) {
-        const result = await supabase!.auth.verifyOtp({ token_hash: tokenHash, type: 'invite' })
-        if (result.error) { setError('আমন্ত্রণের লিংকটি মেয়াদোত্তীর্ণ বা অকার্যকর।'); return }
+        verification.current ??= supabase!.auth.verifyOtp({ token_hash: tokenHash, type: tokenType }).then(result => !result.error)
+        if (!await verification.current) { setError('আমন্ত্রণের লিংকটি মেয়াদোত্তীর্ণ বা অকার্যকর।'); return }
       }
       const { data } = await supabase!.auth.getSession()
-      if (data.session) setReady(true)
-      else setError('আমন্ত্রণের লিংকটি খুলে আবার চেষ্টা করুন।')
+      if (!data.session) { setError('আমন্ত্রণের লিংকটি খুলে আবার চেষ্টা করুন।'); return }
+      const { data: profile, error: profileError } = await supabase!.from('profiles').select('role,invitation_accepted_at').eq('id', data.session.user.id).maybeSingle()
+      if (profileError || profile?.role !== 'staff' || profile.invitation_accepted_at) {
+        setError('এই আমন্ত্রণটি অপেক্ষমাণ নেই বা ইতিমধ্যে গ্রহণ করা হয়েছে।')
+        return
+      }
+      setReady(true)
     }
     void check()
   }, [])
@@ -251,8 +277,10 @@ export function AdminAcceptInvite() {
     if (password !== confirm) { setError('দুইবার দেওয়া পাসওয়ার্ড মিলছে না।'); return }
     setBusy(true); setError('')
     const result = await supabase!.auth.updateUser({ password })
+    if (result.error) { setError(result.error.message); setBusy(false); return }
+    const activation = await supabase!.rpc('complete_staff_invitation')
     setBusy(false)
-    if (result.error) setError(result.error.message)
+    if (activation.error) setError(`অ্যাকাউন্ট সক্রিয় করা যায়নি: ${activation.error.message}`)
     else navigate('/admin')
   }
   return <div className="admin-auth"><div className="auth-card"><img className="auth-logo-img" src="/karana-logo.jpg" alt="Karana Fashion" /><span className="section-kicker">TEAM INVITATION</span><h1>অ্যাকাউন্ট সেটআপ</h1>{!ready ? <p>{error || 'আমন্ত্রণ যাচাই হচ্ছে…'}</p> : <><p>ড্যাশবোর্ডে প্রবেশের জন্য আপনার পাসওয়ার্ড তৈরি করুন।</p><form onSubmit={finish}><label>নতুন পাসওয়ার্ড<input type="password" autoComplete="new-password" minLength={12} required value={password} onChange={e => setPassword(e.target.value)} /></label><label>আবার লিখুন<input type="password" autoComplete="new-password" minLength={12} required value={confirm} onChange={e => setConfirm(e.target.value)} /></label>{error && <p className="form-error" role="alert">{error}</p>}<button className="btn btn-dark" disabled={busy}>{busy ? 'সেভ হচ্ছে…' : 'পাসওয়ার্ড সেভ করুন'}</button></form></>}<Link to="/team/access" className="back-link">লগইনে ফিরুন</Link></div></div>

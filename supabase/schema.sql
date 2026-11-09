@@ -7,6 +7,7 @@ create table public.profiles (
   email text not null,
   role text not null check (role in ('admin', 'staff')),
   active boolean not null default true,
+  invitation_accepted_at timestamptz,
   created_at timestamptz not null default now()
 );
 
@@ -103,14 +104,16 @@ create table public.order_events (
 
 create or replace function public.has_role(allowed_role text)
 returns boolean language sql stable security definer set search_path = '' as $$
-  select exists(select 1 from public.profiles where id = (select auth.uid()) and active and role = allowed_role)
+  select exists(select 1 from public.profiles where id = (select auth.uid()) and active and role = allowed_role
+    and (role = 'admin' or invitation_accepted_at is not null))
 $$;
 revoke all on function public.has_role(text) from public;
 grant execute on function public.has_role(text) to anon, authenticated;
 
 create or replace function public.is_team_member()
 returns boolean language sql stable security definer set search_path = '' as $$
-  select exists(select 1 from public.profiles where id = (select auth.uid()) and active and role in ('admin','staff'))
+  select exists(select 1 from public.profiles where id = (select auth.uid()) and active and role in ('admin','staff')
+    and (role = 'admin' or invitation_accepted_at is not null))
 $$;
 revoke all on function public.is_team_member() from public;
 grant execute on function public.is_team_member() to authenticated;
@@ -148,8 +151,31 @@ revoke all on public.profiles, public.products, public.product_variants, public.
 grant select on public.products, public.product_variants, public.delivery_zones to anon, authenticated;
 grant select on public.public_business_settings to anon, authenticated;
 grant select, insert, update, delete on public.profiles, public.products, public.product_variants, public.delivery_zones, public.business_settings to authenticated;
+revoke insert, update, delete on public.profiles from authenticated;
+grant update (active) on public.profiles to authenticated;
 grant select, update on public.orders to authenticated;
 grant select on public.order_events to authenticated;
+
+create or replace function public.complete_staff_invitation()
+returns void language plpgsql security definer set search_path = '' as $$
+begin
+  update public.profiles as p
+  set invitation_accepted_at = now(), active = true
+  where p.id = (select auth.uid()) and p.role = 'staff'
+    and p.invitation_accepted_at is null
+    and exists (
+      select 1 from auth.users as u
+      where u.id = p.id and u.invited_at is not null
+        and u.email_confirmed_at is not null
+        and nullif(u.encrypted_password, '') is not null
+    );
+  if not found then
+    raise exception 'Invitation is not ready to complete';
+  end if;
+end
+$$;
+revoke all on function public.complete_staff_invitation() from public, anon;
+grant execute on function public.complete_staff_invitation() to authenticated;
 
 create or replace function public.guard_order_update()
 returns trigger language plpgsql security definer set search_path = '' as $$

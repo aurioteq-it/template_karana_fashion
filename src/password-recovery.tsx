@@ -61,9 +61,9 @@ export function TeamResetPassword() {
       const { data: auth, error: authError } = await supabase!.auth.getUser()
       if (!alive) return
       if (authError || !auth.user) { setError('ইমেইলের রিসেট লিংকটি খুলে আবার চেষ্টা করুন।'); setChecking(false); return }
-      const { data: profile, error: profileError } = await supabase!.from('profiles').select('role,active').eq('id', auth.user.id).maybeSingle()
+      const { data: profile, error: profileError } = await supabase!.from('profiles').select('role,active,invitation_accepted_at').eq('id', auth.user.id).maybeSingle()
       if (!alive) return
-      if (profileError || !profile?.active || !['admin', 'staff'].includes(profile.role)) {
+      if (profileError || !profile?.active || !['admin', 'staff'].includes(profile.role) || (profile.role === 'staff' && !profile.invitation_accepted_at)) {
         await supabase!.auth.signOut()
         if (alive) { setError('এই অ্যাকাউন্টের টিম অ্যাক্সেস নেই।'); setChecking(false) }
         return

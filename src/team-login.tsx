@@ -17,8 +17,8 @@ export function TeamLogin() {
     async function check() {
       const { data } = await supabase!.auth.getUser()
       if (data.user) {
-        const { data: profile } = await supabase!.from('profiles').select('role,active').eq('id', data.user.id).maybeSingle()
-        if (alive && profile?.active && ['admin', 'staff'].includes(profile.role)) navigate('/admin', { replace: true })
+        const { data: profile } = await supabase!.from('profiles').select('role,active,invitation_accepted_at').eq('id', data.user.id).maybeSingle()
+        if (alive && profile?.active && ['admin', 'staff'].includes(profile.role) && (profile.role === 'admin' || profile.invitation_accepted_at)) navigate('/admin', { replace: true })
       }
       if (alive) setChecking(false)
     }
@@ -34,8 +34,8 @@ export function TeamLogin() {
     try {
       const result = await supabase.auth.signInWithPassword({ email: email.trim(), password })
       if (result.error || !result.data.user) throw new Error('denied')
-      const { data: profile, error: profileError } = await supabase.from('profiles').select('role,active').eq('id', result.data.user.id).maybeSingle()
-      if (profileError || !profile?.active || !['admin', 'staff'].includes(profile.role)) {
+      const { data: profile, error: profileError } = await supabase.from('profiles').select('role,active,invitation_accepted_at').eq('id', result.data.user.id).maybeSingle()
+      if (profileError || !profile?.active || !['admin', 'staff'].includes(profile.role) || (profile.role === 'staff' && !profile.invitation_accepted_at)) {
         await supabase.auth.signOut()
         throw new Error('denied')
       }
