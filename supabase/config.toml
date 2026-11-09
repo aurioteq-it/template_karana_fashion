@@ -2,3 +2,8 @@ project_id = "template_karana_fashion"
 
 [auth]
 enable_signup = false
+site_url = "http://127.0.0.1:5173"
+additional_redirect_urls = ["http://127.0.0.1:5173/admin/accept-invite", "http://127.0.0.1:5173/team/reset-password"]
+
+[functions.clear-order-history]
+verify_jwt = true

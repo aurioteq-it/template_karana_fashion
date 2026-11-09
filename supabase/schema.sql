@@ -13,6 +13,7 @@ create table public.profiles (
 create table public.products (
   id uuid primary key default gen_random_uuid(),
   name text not null check (length(trim(name)) between 1 and 160),
+  category text not null default '' check (length(category) <= 80),
   subtitle text not null default '',
   description text not null default '',
   details text[] not null default '{}',
@@ -29,6 +30,7 @@ create table public.product_variants (
   product_id uuid not null references public.products(id) on delete cascade,
   label text not null check (length(trim(label)) between 1 and 80),
   sku text not null unique,
+  image_url text not null default '',
   price numeric(12,2) not null check (price >= 0),
   compare_at_price numeric(12,2) check (compare_at_price is null or compare_at_price >= price),
   stock integer not null default 0 check (stock >= 0),
@@ -52,6 +54,12 @@ create table public.business_settings (
   return_policy text not null default '',
   privacy_policy text not null default '',
   terms text not null default '',
+  facebook_pixel_id text not null default '',
+  facebook_domain_verification text not null default '',
+  google_analytics_id text not null default '',
+  google_tag_manager_id text not null default '',
+  google_domain_verification text not null default '',
+  tracking_enabled boolean not null default false,
   updated_at timestamptz not null default now()
 );
 create unique index single_settings_row on public.business_settings ((true));
@@ -60,6 +68,7 @@ create table public.orders (
   id uuid primary key default gen_random_uuid(),
   submission_key uuid not null unique,
   reference text not null unique,
+  customer_user_id uuid references auth.users(id) on delete set null,
   status text not null default 'new' check (status in ('new','confirmed','processing','shipped','delivered','cancelled','returned')),
   name text not null,
   phone text not null,
@@ -69,6 +78,7 @@ create table public.orders (
   product_id uuid not null references public.products(id),
   variant_id uuid not null references public.product_variants(id),
   product_name text not null,
+  product_image_url text not null default '',
   variant_label text not null,
   quantity integer not null check (quantity between 1 and 10),
   unit_price numeric(12,2) not null,
@@ -80,6 +90,7 @@ create table public.orders (
 );
 create index orders_created_at_idx on public.orders(created_at desc);
 create index orders_phone_idx on public.orders(phone);
+create index orders_customer_user_id_idx on public.orders(customer_user_id, created_at desc) where customer_user_id is not null;
 
 create table public.order_events (
   id bigint generated always as identity primary key,
@@ -122,12 +133,15 @@ create policy zones_public_read on public.delivery_zones for select to anon, aut
 create policy zones_admin_write on public.delivery_zones for all to authenticated using (public.has_role('admin')) with check (public.has_role('admin'));
 create policy settings_admin on public.business_settings for all to authenticated using (public.has_role('admin')) with check (public.has_role('admin'));
 create policy orders_team_read on public.orders for select to authenticated using (public.is_team_member());
+create policy orders_customer_read on public.orders for select to authenticated using (customer_user_id = (select auth.uid()));
 create policy orders_team_update on public.orders for update to authenticated using (public.is_team_member()) with check (public.is_team_member());
 create policy events_team_read on public.order_events for select to authenticated using (public.is_team_member());
 
 -- The view contains only fields approved for public display. The base table remains admin-only.
 create view public.public_business_settings with (security_barrier = true) as
-select brand_name, contact_phone, support_hours, delivery_note, return_policy, privacy_policy, terms
+select brand_name, contact_phone, support_hours, delivery_note, return_policy, privacy_policy, terms,
+       facebook_pixel_id, facebook_domain_verification, google_analytics_id,
+       google_tag_manager_id, google_domain_verification, tracking_enabled
 from public.business_settings;
 
 revoke all on public.profiles, public.products, public.product_variants, public.delivery_zones, public.business_settings, public.orders, public.order_events from anon, authenticated;
@@ -160,9 +174,24 @@ begin
 end $$;
 create trigger orders_log_status after update on public.orders for each row execute function public.log_order_status();
 
+-- Save the product photo seen at checkout so later catalog edits do not change the order record.
+create or replace function public.set_order_product_image()
+returns trigger language plpgsql security definer set search_path = '' as $$
+begin
+  new.product_image_url := coalesce((
+    select coalesce(nullif(v.image_url, ''), p.image_urls[1], '')
+    from public.product_variants v join public.products p on p.id = v.product_id
+    where v.id = new.variant_id and p.id = new.product_id
+  ), '');
+  return new;
+end $$;
+revoke all on function public.set_order_product_image() from public, anon, authenticated;
+create trigger orders_product_image before insert on public.orders
+for each row execute function public.set_order_product_image();
+
 -- Called only by the Edge Function with its server-side service role.
 -- Advisory lock protects repeated simultaneous submissions; row lock protects stock.
-create or replace function public.place_cod_order(payload jsonb)
+create or replace function public.place_cod_order(payload jsonb, shopper_user_id uuid)
 returns jsonb language plpgsql security definer set search_path = '' as $$
 declare
   v_key uuid;
@@ -177,6 +206,7 @@ declare
   v_area text;
   v_address text;
   v_reference text;
+  v_customer_user_id uuid;
 begin
   begin
     v_key := (payload->>'submission_key')::uuid;
@@ -194,6 +224,7 @@ begin
   v_district := trim(coalesce(payload->>'district',''));
   v_area := trim(coalesce(payload->>'area',''));
   v_address := trim(coalesce(payload->>'address',''));
+  v_customer_user_id := shopper_user_id;
   if length(v_name) not between 2 and 80 or length(v_district) not between 2 and 80
     or length(v_area) not between 2 and 100 or length(v_address) not between 8 and 300
     or v_phone !~ '^01[3-9][0-9]{8}$' then
@@ -213,24 +244,55 @@ begin
 
   v_reference := 'KF-' || upper(substr(replace(gen_random_uuid()::text, '-', ''), 1, 12));
   insert into public.orders (
-    submission_key, reference, name, phone, district, area, address,
+    submission_key, reference, customer_user_id, name, phone, district, area, address,
     product_id, variant_id, product_name, variant_label, quantity,
     unit_price, delivery_fee, total
   ) values (
-    v_key, v_reference, v_name, v_phone, v_district, v_area, v_address,
+    v_key, v_reference, v_customer_user_id, v_name, v_phone, v_district, v_area, v_address,
     v_product.id, v_variant.id, v_product.name, v_variant.label, v_quantity,
     v_variant.price, v_zone.fee, v_variant.price * v_quantity + v_zone.fee
   );
   update public.product_variants set stock = stock - v_quantity where id = v_variant.id;
   return jsonb_build_object('reference', v_reference);
 end $$;
-revoke all on function public.place_cod_order(jsonb) from public, anon, authenticated;
-grant execute on function public.place_cod_order(jsonb) to service_role;
+revoke all on function public.place_cod_order(jsonb, uuid) from public, anon, authenticated;
+grant execute on function public.place_cod_order(jsonb, uuid) to service_role;
 
 -- Public product image storage. Upload and removal remain admin-only.
-insert into storage.buckets(id, name, public) values ('product-images', 'product-images', true)
+insert into storage.buckets(id, name, public, file_size_limit, allowed_mime_types)
+values ('product-images', 'product-images', true, 5242880, array['image/jpeg','image/png','image/webp','image/avif'])
 on conflict (id) do nothing;
 create policy product_images_read on storage.objects for select to anon, authenticated using (bucket_id = 'product-images');
 create policy product_images_admin_insert on storage.objects for insert to authenticated with check (bucket_id = 'product-images' and public.has_role('admin'));
 create policy product_images_admin_update on storage.objects for update to authenticated using (bucket_id = 'product-images' and public.has_role('admin')) with check (bucket_id = 'product-images' and public.has_role('admin'));
 create policy product_images_admin_delete on storage.objects for delete to authenticated using (bucket_id = 'product-images' and public.has_role('admin'));
+
+-- Minimal audit record for admin-initiated order-history cleanup.
+create table public.order_history_purges (
+  id bigint generated always as identity primary key,
+  admin_user_id uuid not null,
+  deleted_orders integer not null,
+  created_at timestamptz not null default now()
+);
+alter table public.order_history_purges enable row level security;
+revoke all on public.order_history_purges from public, anon, authenticated;
+
+create or replace function public.admin_clear_order_history(admin_user_id uuid)
+returns integer language plpgsql security definer set search_path = '' as $$
+declare
+  deleted_count integer;
+begin
+  if not exists (select 1 from public.profiles where id = admin_user_id and role = 'admin' and active) then
+    raise exception 'Admin access required';
+  end if;
+  if exists (select 1 from public.products where active and not is_demo) then
+    raise exception 'Pause checkout before cleaning order history';
+  end if;
+  lock table public.orders in access exclusive mode;
+  select count(*) into deleted_count from public.orders;
+  delete from public.orders;
+  insert into public.order_history_purges(admin_user_id, deleted_orders) values (admin_user_id, deleted_count);
+  return deleted_count;
+end $$;
+revoke all on function public.admin_clear_order_history(uuid) from public, anon, authenticated;
+grant execute on function public.admin_clear_order_history(uuid) to service_role;

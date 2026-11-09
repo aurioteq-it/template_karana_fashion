@@ -27,7 +27,7 @@ async function probe(label, path, options = {}) {
     if (response.headers.get('content-type')?.includes('application/json')) {
       const body = await response.text()
       const json = body ? JSON.parse(body) : null
-      if (Array.isArray(json)) detail = `rows=${json.length}${label === 'Public product' && json[0] ? ` demo=${Boolean(json[0].is_demo)}` : ''}`
+      if (Array.isArray(json)) detail = `rows=${json.length}${label === 'Public product' && json[0] ? ` demo=${Boolean(json[0].is_demo)} images=${json[0].image_urls?.length ?? 0}` : ''}${label === 'Public variants' ? ` image_ready=${json.filter(row => Boolean(row.image_url)).length}` : ''}`
       else if (json && typeof json === 'object') detail = `code=${String(json.code ?? json.error_code ?? json.error ?? 'unknown').slice(0, 80)}`
     }
     console.log(`${label}: HTTP ${response.status}${detail ? ` ${detail}` : ''}`)
@@ -39,17 +39,18 @@ async function probe(label, path, options = {}) {
 }
 
 const results = await Promise.all([
-  probe('Public product', '/rest/v1/products?select=id,is_demo,active&active=eq.true&limit=1'),
-  probe('Public variants', '/rest/v1/product_variants?select=id,label,price,stock&limit=1'),
+  probe('Public product', '/rest/v1/products?select=id,category,image_urls,is_demo,active&active=eq.true&limit=1'),
+  probe('Public variants', '/rest/v1/product_variants?select=id,label,image_url,price,stock&active=eq.true'),
   probe('Delivery zones', '/rest/v1/delivery_zones?select=id,label,fee&limit=1'),
-  probe('Public settings', '/rest/v1/public_business_settings?select=brand_name&limit=1'),
+  probe('Public settings', '/rest/v1/public_business_settings?select=brand_name,tracking_enabled,facebook_pixel_id,google_analytics_id&limit=1'),
   probe('Orders anonymous read', '/rest/v1/orders?select=id&limit=1'),
   probe('Profiles anonymous read', '/rest/v1/profiles?select=id&limit=1'),
+  probe('Shopper order RPC anonymous', '/rest/v1/rpc/place_cod_order', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ payload: {}, shopper_user_id: null }) }),
   probe('Order function', '/functions/v1/place-order', { method: 'OPTIONS' }),
   probe('Staff function', '/functions/v1/invite-staff', { method: 'OPTIONS' }),
 ])
 const publicDataReady = results.slice(0, 4).every(status => status === 200)
-const privateDataBlocked = results.slice(4, 6).every(status => status === 401 || status === 403)
-const functionsReady = results.slice(6).every(status => status === 200 || status === 204)
+const privateDataBlocked = results.slice(4, 7).every(status => status === 401 || status === 403)
+const functionsReady = results.slice(7).every(status => status === 200 || status === 204)
 console.log(`Summary: public data ${publicDataReady ? 'ready' : 'missing'}, private access ${privateDataBlocked ? 'blocked' : 'unverified'}, functions ${functionsReady ? 'ready' : 'missing'}`)
 if (!publicDataReady || !privateDataBlocked || !functionsReady) process.exitCode = 1

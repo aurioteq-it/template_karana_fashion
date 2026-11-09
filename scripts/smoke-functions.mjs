@@ -14,6 +14,14 @@ const invalidOrder = await fetch(new URL('/functions/v1/place-order', root), {
 })
 console.log(`Invalid order rejected: HTTP ${invalidOrder.status}`)
 
+const invalidSessionOrder = await fetch(new URL('/functions/v1/place-order', root), {
+  method: 'POST',
+  headers: { apikey: key, Authorization: 'Bearer invalid-session-smoke-test', 'Content-Type': 'application/json' },
+  body: '{}',
+  signal: AbortSignal.timeout(12000),
+})
+console.log(`Invalid shopper session rejected: HTTP ${invalidSessionOrder.status}`)
+
 const noAuthInvite = await fetch(new URL('/functions/v1/invite-staff', root), {
   method: 'POST',
   headers: { apikey: key, 'Content-Type': 'application/json' },
@@ -22,4 +30,4 @@ const noAuthInvite = await fetch(new URL('/functions/v1/invite-staff', root), {
 })
 console.log(`Unauthenticated staff invite rejected: HTTP ${noAuthInvite.status}`)
 
-if (invalidOrder.status !== 400 || noAuthInvite.status !== 401) process.exitCode = 1
+if (invalidOrder.status !== 400 || invalidSessionOrder.status !== 401 || noAuthInvite.status !== 401) process.exitCode = 1
